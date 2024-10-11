@@ -1,0 +1,381 @@
+---
+title: "Implement Fed-GLMM in Distributed Data Settings"
+output: html_notebook
+---
+
+This document aims to provide an operational workflow for Federated Generalized Linear Mixed Models (Fed-GLMM) involving distributed data sources.
+
+## Step 1: Obtain Initial Estimates
+
+Firstly, run GLMM at each site. We demonstrate this on a set of distributed simulated datasets.
+
+```{r}
+library(dplyr)  # Data manipulation
+library(purrr)  # Functional programming tools
+library(tibble) # Data frames
+library(lme4)   # Generalized linear mixed models
+library(numDeriv) # Numerical derivatives
+
+source("data_simulator.R")
+# Simulate test data
+K <- 8 # number of sites
+n <- 4 # number of visits per patient
+m <- seq(from = 100, to = 50*(K+1), by = 50) # number of patients per site
+N <- sum(m)*n # number of total observations
+M <- sum(m) # number of total patients
+site <- rep(1:K, m*n) # site index for each observation
+patient <- rep(1:M, each = n) # patient index for each observation
+
+# Generate site-specific fixed effects
+set.seed(100); beta_site <- map(rnorm(K, 0.5, 0.5) %>% round(1), ~c(1.5, 1, ., 0.5, 0.5)) # Fixed effects for each site, including the intercept; the coefficient for X2 varies across sites, while others are shared
+
+# Generate site-specific variance component parameters
+set.seed(200); theta_site <- rnorm(K, 1, 0.5) %>% round(1) %>% as.list # Variance component parameter for each site
+
+# Generate covariates
+X <- data.frame(X0 = 1, X1 = rbinom(N, 1, 0.3)) %>% mutate(X2 = rnorm(N), X3 = runif(N), X4 = rbinom(N, 1, 0.5)) %>% as.matrix
+
+# Generate synthetic dataset for testing
+test_data <- get_simulated_df(X, patient, site, 1, beta_site, theta_site)
+
+distributed_test_data <- group_split(test_data, site)
+
+
+# Define GLMM formula
+formula <- Y ~ 1 + X1 + X2 + X3 + X4 + (1 | patient)
+
+# Parameter names
+par_name <- c("theta1", "Intercept", paste0("X", 1:4))
+
+# Fit GLMM for each site separately
+glmm_local <- distributed_test_data %>% map(~glmer(formula, data = ., family = binomial, nAGQ = 1, control = glmerControl("bobyqa", optCtrl = list(maxfun = 1e5))))
+
+# Extract parameter estimates and variances for each site; this is the recommanded way to organize the site estimates
+estimate_local <- glmm_local %>% map(~data.frame(Parameter = par_name, Estimate = c(.@theta, .@beta), Variance = solve(.@optinfo$derivs$Hessian/2) %>% diag) %>% column_to_rownames("Parameter"))
+
+estimate_local
+```
+
+Then, we can perform meta-analysis to obtain initial parameter estimates using the function `get_meta_initial()`. Typically, fixed-effects meta-analysis is used. However, we can optionally employ random-effects meta-analysis for a subset of covariates of choices.
+
+```{r}
+# site names should be in the same order as that of estimate_local
+get_meta_initial <- function(estimate_local, par_name, site_names, RE_meta_exist = F, RE_meta_var = NULL){
+  library(metafor)
+  # Combine site-specific estimates for meta-analysis
+  meta_stat_df <- map(par_name, ~lapply(estimate_local, function(x){x[.,]})) %>% set_names(par_name) %>% 
+    map(~do.call(rbind, .)) %>% 
+    map(~mutate(., site = site_names))
+  
+  # Perform random-effects meta-analysis for a subset of selcted variables and fixed-effects meta-analysis for other parameters
+  if (RE_meta_exist){
+    RE_meta <- map_dbl(RE_meta_var, ~rma(Estimate, Variance, data = meta_stat_df[[.]], method = "REML", control = list(maxiter = 1e9, stepadj = 0.1))$beta) %>% set_names(RE_meta_var)  
+  }
+  
+  FE_meta <- map_dbl(par_name %>% setdiff(RE_meta_var), ~rma(Estimate, Variance, data = meta_stat_df[[.]], method = "FE")$beta) %>% set_names(par_name %>% setdiff(RE_meta_var))
+  
+  # Combine meta-analysis results as initial estimates
+  meta_estimate <- c(RE_meta, FE_meta) %>% .[par_name]
+  
+  return(list(meta_estimate = meta_estimate, meta_stat_df = meta_stat_df))
+  
+}
+
+meta <- get_meta_initial(estimate_local, par_name, unique(site), RE_meta_exist = T, RE_meta_var = "X2")
+meta_estimate <- meta$meta_estimate
+meta_stat_df <- meta$meta_stat_df
+
+meta_estimate
+meta_stat_df
+```
+
+
+Depending on the configuration of site-varying parameters and site-sharing parameters, the meta-analysis results can be arranged differently to provide the vector of initial estimate for Fed-GLMM. The order of the estimates in the vector should be: variance components by sites, followed by site-sharing fixed effects, followed by site-varying fixed effects by sites). Here is an example:
+
+  - We have 1 variance component parameter, which varies across sites
+  - The third column of original design matrix X (i,e., X2) correspond to the the site-varying fixed effect
+  - Meta analysis estimates are used to provide site-sharing estimates
+  - Inidividual GLMM results are used to provide site-varying estimates
+
+```{r}
+n_theta <- 1; FE_site_loc <- 3 
+alpha_prior <- meta_stat_df[n_theta + FE_site_loc] %>% map("Estimate") %>% transpose %>% map(unlist)
+theta_prior <- meta_stat_df[1:n_theta] %>% map("Estimate") %>% transpose %>% map(unlist)
+beta_prior <- meta_estimate[-(1:n_theta)][-FE_site_loc]
+
+# Create a combined initial value vector for Fed-GLMM
+initial_value <- c(unlist(theta_prior), beta_prior, unlist(alpha_prior))
+
+initial_value
+```
+
+
+## Step 2: Obtain Summary Level Statistics from Sites
+
+Each site needs to run the function `get_glmer_derivative()` to obtain summary level statistics (gradients and Hessians) that are then passed along to the central analytics. Note if site-varying parameters are specified, each site should use their site-specific values to calculate derivatives. In addition, the site-varying fixed effect estimates appended to the tail of the long estimate vector, if any, should be put back to their original place. For example, each site-specific X2 coefficient should be put back to the third (`FE_site_loc`) position of the `beta` parameter in the input of `get_glmer_derivative()`.
+
+```{r}
+# Helper function: obtain gradients and Hessians of the GLMM model
+# Parameters:
+# - formula: Formula specifying the model structure.
+# - data: Data to fit the model.
+# - beta_prior: Prior values for fixed effects
+# - theta: Prior values for variance component parameters.
+# - ...: Additional arguments for the GLMM.
+# Outputs: site gradient and Hessian
+get_glmer_derivative <- function(formula, data, beta_prior, theta, ...){
+  # Get deviance function for GLMM
+  devfun <- glmer(formula, data, devFunOnly = T, ...)
+  
+  # Calculate gradient and Hessian using numerical differentiation
+  gradient <- grad(devfun, c(theta, beta_prior)); Hessian <- hessian(devfun, c(theta, beta_prior))
+  
+  return(list(gradient = gradient, Hessian = Hessian))
+}
+```
+
+
+Here is an example for a single site (site 2) out of 8 sites. The site-specific coefficient estimate for X2 is at index 14, so we have to move it back to right after the second shared coefficient estimates.
+
+```{r}
+single_site_derivative <- get_glmer_derivative(formula, distributed_test_data[[2]], beta = append(initial_value[9:12], initial_value[12+2],2), theta = initial_value[2], family = binomial(), nAGQ = 1, control = glmerControl("bobyqa", optCtrl = list(maxfun = 1e5)))
+
+single_site_derivative
+```
+
+
+The following function is only used for combining derivatives given access to the pooled data, but it gives the idea of how the collected derivatives should look like at the central analytics.
+
+```{r}
+# Helper function: generate a full list of derivatives for all sites (given access to full data or simulated data)
+# Parameters:
+# - formula: Formula specifying the model structure.
+# - data: Data to fit the model.
+# - site_var: Column name for site variable.
+# - FE_site_loc: Indices of site-specific fixed effects. NULL if all fixed effects are shared.
+# - estimate_prior: Initial estimates for variance components and fixed effects. The order should be: variance components by sites, followed by site-sharing fixed effects, followed by site-varying fixed effects by sites)
+# - common_theta: whether the variance component parameters are shared (T) or different (F) across sites.
+# - ...: Additional arguments for the GLMM.
+# Outputs: a list of derivatives from all sites; each element should also be a list consisting a vector called "gradient" and a matrix call "Hessian".
+
+get_derivative_list <- function(formula, data, site_var, FE_site_loc, estimate_prior, common_theta = F, ...){
+  # Identify the number of sites (K), variance component parameters (n_theta), and site-varying fixed effects (n_alpha)
+  site <- data[[site_var]]
+  K <- length(unique(site))
+  n_alpha <- length(FE_site_loc)
+  n_theta <- glFormula(formula, data, ...)$reTrms$theta %>% length
+  
+  # Split prior estimates for variance component parameters and site-sharing fixed effects
+  if(common_theta == T){
+    K_theta <- 1
+    theta_list <- rep(list(estimate_prior[1: n_theta]), K)
+  } else {
+    K_theta <- K
+    theta_list <- estimate_prior[(1): (K*n_theta)] %>% split(ceiling(seq_along(.)/n_theta))  
+  }
+  
+  n_beta <- length(estimate_prior) - K_theta*n_theta - K*n_alpha 
+  beta_shared <- estimate_prior[(K_theta*n_theta + 1): (K_theta*n_theta + n_beta)]
+  
+  # Split data by site
+  site_data <- map(unique(site), ~data[site == .,])
+  
+  # Create a list of full fixed effect estimates for each site
+  beta_list <- list(beta_shared) %>% rep(K)
+  if(!is.null(FE_site_loc)){
+    beta_site_list <- estimate_prior[(K_theta*n_theta + n_beta + 1): (K_theta*n_theta + n_beta + K*n_alpha)] %>% split(ceiling(seq_along(.)/n_alpha))
+    for(i in 1:length(FE_site_loc)){
+      beta_list <- map2(beta_list, beta_site_list, ~append(.x, .y[i], after = FE_site_loc[i]-1))
+    }  
+  }
+  
+  # Compute gradients and Hessians for each site
+  derivative_list_full <- derivative_list <- glmer_derivative <- pmap(list(site_data, beta_list, theta_list), possibly(function(A, B, C){get_glmer_derivative(formula, A, B, C, ...)}, otherwise = NULL))
+  
+  # Handle missing gradient/Hessian by averaging existing ones if needed
+  if(length(compact(glmer_derivative)) < length(unique(site))){
+    dev_gradient_avg <- map(derivative_list %>% compact, ~.$gradient) %>% Reduce("+", .) %>% `/`(length(derivative_list %>% compact))  
+    dev_Hessian_avg <- map(derivative_list %>% compact, ~.$Hessian) %>% Reduce("+", .) %>% `/`(length(derivative_list %>% compact)) 
+    derivative_list_full <- derivative_list %>% map(function(x){if(is.null(x)){list(gradient = dev_gradient_avg, Hessian = dev_Hessian_avg)} else {x}})
+  }
+  
+  return(derivative_list_full)
+}
+
+derivative_list <- get_derivative_list(formula, test_data, "site", FE_site_loc = 3, estimate_prior = initial_value, common_theta = F, family = binomial(), nAGQ = 1, control = glmerControl("bobyqa", optCtrl = list(maxfun = 1e5)))
+
+derivative_list
+```
+
+
+## Step 3 Update the Estimates
+
+Use the function `get_one_iteration()` to update the parameters, given the derivatives collected in the last step, with the help of the helper function `get_FE_site_rearraged()`. 
+
+```{r}
+# Helper function: Rearranges derivatives for each site
+# Parameters:
+# - deriv: Derivative vector or matrix (gradient or Hessian).
+# - FE_site_loc: Indices of site-specific fixed effects. NULL if all fixed effects are shared.
+# - n_theta: Number of variance component parameters.
+# Outputs: rearranged derivatives
+get_FE_site_rearranged <- function(deriv, FE_site_loc, n_theta){
+  if(is.null(FE_site_loc)){
+    return(deriv)
+  } else {
+    # Adjust indices of site-varying fixed effects by n_theta slots 
+    FE_site_loc_full <- FE_site_loc + n_theta 
+    
+    # Rearrange gradient
+    if(is.vector(deriv)){
+      return(deriv[-FE_site_loc_full] %>% c(deriv[FE_site_loc_full]))
+    } else {
+      # Rearrange Hessian
+      deriv_tranCol <- deriv[,-FE_site_loc_full] %>% cbind(deriv[,FE_site_loc_full]) 
+      return(deriv_tranCol[-FE_site_loc_full,] %>% rbind(deriv_tranCol[FE_site_loc_full,])) 
+    }  
+  }
+}
+
+
+# One iteration of Fed-GLMM estimation
+# Parameters:
+# - derivative_list_full: a list of derivatives from all sites; each element should also be a list consisting a vector called "gradient" and a matrix call "Hessian".
+# - site_names: a vector of unique site names or indices.
+# - FE_site_loc: Indices of site-specific fixed effects. NULL if all fixed effects are shared.
+# - estimate_prior: Initial estimates for variance components and fixed effects. The order should be: variance components by sites, followed by site-sharing fixed effects, followed by site-varying fixed effects by sites)
+# - n_theta: the number of variance component parameters.
+# - common_theta: whether the variance component parameters are shared (T) or different (F) across sites.
+# - ...: Additional arguments for the GLMM.
+# Outputs: 
+# - estimate_bar: updated parameter estimates with the same order as that of estimate_prior
+# - gradient_t: global gradient for the current iteration
+# - Hessian_t: global Hessian for the current iteration
+get_one_iteration <- function(derivative_list_full, site_names, FE_site_loc, estimate_prior, n_theta, common_theta = F){
+  
+  K <- length(site_names)
+  n_alpha <- length(FE_site_loc)
+  
+  # Split prior estimates for variance component parameters and site-sharing fixed effects
+  if(common_theta == T){
+    K_theta <- 1
+  } else {
+    K_theta <- K
+  }
+  
+  n_beta <- length(estimate_prior) - K_theta*n_theta - K*n_alpha 
+  
+  # Rearrange the gradients and Hessians for fixed effects
+  gradient_list_rearranged <- derivative_list_full %>% map(~.$gradient/(-2)) %>% map(~get_FE_site_rearranged(.,FE_site_loc, n_theta))
+  Hessian_list_rearranged <- derivative_list_full %>% map(~.$Hessian/(-2)) %>% map(~get_FE_site_rearranged(.,FE_site_loc, n_theta))
+  
+  # Extract and combine the gradients for variance component parameters, site-sharing fixed effects, and site-varying fixed effects
+  if(common_theta == T){
+    gradient_theta <- gradient_list_rearranged %>% map(~.[1:n_theta]) %>% Reduce("+", .)
+  } else {
+    gradient_theta <- gradient_list_rearranged %>% map(~.[1:n_theta]) %>% unlist  
+  }
+  gradient_beta <- gradient_list_rearranged %>% map(~.[(n_theta + 1):(n_theta + n_beta)]) %>% Reduce("+", .)
+  
+  if(!is.null(FE_site_loc)){
+    gradient_alpha <- gradient_list_rearranged %>% map(~.[(n_theta + n_beta + 1):(n_theta + n_beta + n_alpha)]) %>% unlist  
+  } else {
+    gradient_alpha <- NULL
+  }
+  gradient_t <- c(gradient_theta, gradient_beta, gradient_alpha)
+  
+  # Initialize Hessian matrix
+  Hessian_t <- matrix(0, K_theta*n_theta + n_beta + K*n_alpha, K_theta*n_theta + n_beta + K*n_alpha) %>% 
+    as(Class = "sparseMatrix")
+  
+  # Fill the Hessian matrix by combining Hessians from all sites
+  for(k in 1:K){
+    
+    Hessian_site <- Hessian_list_rearranged[[k]]
+    
+    if(common_theta == T){
+      Hessian_t[(1):(n_beta+n_theta), (1):(n_beta+n_theta)] <- Hessian_t[(1):(n_beta+n_theta), (1):(n_beta+n_theta)] + Hessian_site[(1):(n_beta+n_theta), (1):(n_beta+n_theta)]
+      if(!is.null(FE_site_loc)){
+        Hessian_t[(1):(n_beta+n_theta), (n_beta+n_theta+(k-1)*n_alpha+1):(n_beta+n_theta+k*n_alpha)] <- Hessian_site[(1):(n_beta+n_theta), (n_beta+n_theta+1):(n_beta+n_theta+n_alpha)]
+        Hessian_t[(n_beta+n_theta+(k-1)*n_alpha+1):(n_beta+n_theta+k*n_alpha), (1):(n_beta+n_theta)] <- Hessian_site[(n_beta+n_theta+1):(n_beta+n_theta+n_alpha), (1):(n_beta+n_theta)]
+        Hessian_t[(n_beta+n_theta+(k-1)*n_alpha+1):(n_beta+n_theta+k*n_alpha), (n_beta+n_theta+(k-1)*n_alpha+1):(n_beta+n_theta+k*n_alpha)] <- Hessian_site[(n_beta+n_theta+1):(n_beta+n_theta+n_alpha), (n_beta+n_theta+1):(n_beta+n_theta+n_alpha)]
+      }
+      
+    } else {
+      
+      Hessian_t[((k-1)*n_theta+1):(k*n_theta), ((k-1)*n_theta+1):(k*n_theta)] <- Hessian_site[1:n_theta, 1:n_theta]
+      Hessian_t[((k-1)*n_theta+1):(k*n_theta), (K*n_theta+1):(K*n_theta+n_beta)] <- Hessian_site[1:n_theta, (n_theta+1):(n_theta+n_beta)]
+      
+      if(!is.null(FE_site_loc)){
+        Hessian_t[((k-1)*n_theta+1):(k*n_theta), (K*n_theta+n_beta+(k-1)*n_alpha+1):(K*n_theta+n_beta+k*n_alpha)] <- Hessian_site[1:n_theta, (n_theta+ n_beta+1):(n_theta+ n_beta + n_alpha)]  
+      }
+      
+      Hessian_t[(K*n_theta+1):(K*n_theta+n_beta), ((k-1)*n_theta+1):(k*n_theta)] <- Hessian_site[(n_theta+1):(n_theta+ n_beta), 1:n_theta]
+      Hessian_t[(K*n_theta+1):(K*n_theta+n_beta), (K*n_theta+1):(K*n_theta+n_beta)] <- Hessian_t[(K*n_theta+1):(K*n_theta+n_beta), (K*n_theta+1):(K*n_theta+n_beta)] + Hessian_site[(n_theta+1):(n_theta+ n_beta), (n_theta+1):(n_theta+ n_beta)]
+      
+      if(!is.null(FE_site_loc)){
+        Hessian_t[(K*n_theta+1):(K*n_theta+n_beta), (K*n_theta+n_beta+(k-1)*n_alpha+1):(K*n_theta+n_beta+k*n_alpha)] <- Hessian_site[(n_theta+1):(n_theta+ n_beta), (n_theta+ n_beta+1):(n_theta+ n_beta + n_alpha)]
+        Hessian_t[(K*n_theta+n_beta+(k-1)*n_alpha+1):(K*n_theta+n_beta+k*n_alpha), ((k-1)*n_theta+1):(k*n_theta)] <- Hessian_site[(n_theta+ n_beta+1):(n_theta+ n_beta+ n_alpha), 1:n_theta]
+        Hessian_t[(K*n_theta+n_beta+(k-1)*n_alpha+1):(K*n_theta+n_beta+k*n_alpha), (K*n_theta+1):(K*n_theta+n_beta)] <- Hessian_site[(n_theta+ n_beta+1):(n_theta+ n_beta+ n_alpha), (n_theta+1):(n_theta+ n_beta)]
+        Hessian_t[(K*n_theta+n_beta+(k-1)*n_alpha+1):(K*n_theta+n_beta+k*n_alpha), (K*n_theta+n_beta+(k-1)*n_alpha+1):(K*n_theta+n_beta+k*n_alpha)] <- Hessian_site[(n_theta+ n_beta+1):(n_theta+ n_beta+ n_alpha), (n_theta+ n_beta+1):(n_theta+ n_beta + n_alpha)]
+      }  
+    }
+  }
+  
+  # Update the estimates using the Newton-Raphson method
+  estimate_bar <- as.vector(estimate_prior - solve(Hessian_t) %*% (gradient_t))  # Convert to vector for naming
+  
+  # Generate parameter names dynamically
+  if(common_theta == T){
+    theta_names <- paste0("theta", 1:n_theta)
+  } else {
+    theta_names <- paste0("theta", rep(1:n_theta, times = K), "_site", rep(site_names, each = n_theta))  
+  }
+  beta_names <- paste0("beta", 1:n_beta)
+  if(n_alpha == 0){alpha_names <- NULL} else {alpha_names <- paste0("alpha", rep(1:n_alpha, times = K), "_site", rep(site_names, each = n_alpha))}
+  param_names <- c(theta_names, beta_names, alpha_names)
+  names(estimate_bar) <- param_names
+  
+  return(list(estimate_bar = estimate_bar, gradient_t = gradient_t, Hessian_t = Hessian_t))
+}
+
+```
+
+Here is an example of how one iteration should look like
+
+```{r}
+one_iter <- get_one_iteration(derivative_list_full = derivative_list, site_names = 1:8, FE_site_loc = 3, estimate_prior = initial_value, n_theta = 1, common_theta = F)
+one_iter
+```
+
+
+## Step 4: Check Convergence and Repeat
+
+We can use the function `get_iteration_difference()` to check for convergence. If the convergence is not achieved, then we can eepeat Step 2 and 3, with the `one_iter$estimate_bar` obtained in the last iteration as the parameter values of `beta_prior` and `theta` for `get_glmer_derivative()`. 
+
+
+```{r}
+get_iteration_distance <- function(current_estimate, last_estiamte, divergence_criterion = 200, convergence_criterion = 1e-6){
+  distance <- sqrt(sum((last_estiamte - current_estimate)^2))
+  
+  if (distance > divergence_criterion) {
+    writeLines("The values have diverged.\n")
+  }
+  
+  if (distance < convergence_criterion){
+    writeLines("The values have converged.\n")
+  }
+  return(distance)
+  
+}
+```
+
+For example, we can calculate the updated estimates that we just obtained with the initial values.
+
+```{r}
+get_iteration_distance(one_iter$estimate_bar, initial_value)
+```
+Once the convergence is achieved, we can extract Fed-GLMM outputs from `one_iter$estimate_bar` for parameter estimates and `one_iter$Hessian_t` for variance covariance matrix.
+
+
+
